@@ -89,14 +89,18 @@ class Scheduler:
     def _schedule_pod(self, pod):
         pod_name = pod.metadata.name
         namespace = pod.metadata.namespace or "default"
+        group_id = self._get_group_id(pod)
+        if not group_id:
+            print('no group_id given, will not schedule')
+            return
 
         try:
             node_name = self._select_node()
         except NoNodesAvailableError:
-            group_id = self._get_group_id(pod)
             try:
                 self._preempt_for_group(group_id)
-                node_name = self._select_node()
+                self._schedule_entire_group(group_id)
+                return
             except (InsufficientResourcesError, NoNodesAvailableError) as e:
                 print(f"Failed to schedule {pod_name}: {e}")
                 return
@@ -112,6 +116,43 @@ class Scheduler:
             print(f"Bind failed for {pod_name}: {msg}")
         except Exception as e:
             print(f"Error binding {pod_name}: {e}")
+
+    def _schedule_entire_group(self, group_id: str):
+        group = self.gang_manager.get_group(group_id)
+        if not group:
+            print(f"Group {group_id} not found for scheduling")
+            return
+
+        unscheduled_pods = []
+        for pod in group.pods:
+            if (pod.status.phase == "Pending" and 
+                pod.spec and 
+                pod.spec.scheduler_name == self.scheduler_name and 
+                not pod.spec.node_name):
+                unscheduled_pods.append(pod)
+
+        if not unscheduled_pods:
+            print(f"No unscheduled pods found in group {group_id}")
+            return
+
+        scheduled_count = 0
+        for pod in unscheduled_pods:
+            try:
+                node_name = self._select_node()
+                pod_name = pod.metadata.name
+                namespace = pod.metadata.namespace or "default"
+                
+                print(f"Binding {pod_name} -> {node_name} (group: {group_id})")
+                self._bind_pod(pod_name, node_name, namespace)
+                scheduled_count += 1
+            except (NoNodesAvailableError, ApiException) as e:
+                print(f"Failed to schedule pod {pod.metadata.name} in group {group_id}: {e}")
+                continue
+            except Exception as e:
+                print(f"Error scheduling pod {pod.metadata.name} in group {group_id}: {e}")
+                continue
+
+        print(f"Scheduled {scheduled_count}/{len(unscheduled_pods)} pods in group {group_id}")
 
     def run(self):
         print(f"Starting scheduler: {self.scheduler_name}")
